@@ -1,4 +1,4 @@
-from typing import NamedTuple, Optional, Tuple, Union
+from typing import NamedTuple, Optional, Tuple
 
 import haiku as hk
 import jax
@@ -85,7 +85,7 @@ class FusedSelfAttention(hk.Module):
         super().__init__(name)
         self.n_heads: int = n_heads
 
-    def __call__(self, x: Array) -> dict[str, Array]:
+    def __call__(self, x: Array) -> Array:
         # x: (b, T, d)
         *_, seq_len, d_model = x.shape
 
@@ -139,7 +139,7 @@ class FusedSelfAttention(hk.Module):
         # (d, d)
 
         # (b, T, d)
-        return {"x": attn_vals @ w_o, "attn": attn}
+        return attn_vals @ w_o
 
 
 class ReLU(hk.Module):
@@ -157,12 +157,6 @@ class TransformerBlock(hk.Module):
             [hk.Linear(n_mlp_nodes), ReLU(), hk.Linear(d_model)]
         )
 
-    def __call__(self, x: Array) -> dict[str, Union[Array, dict]] 
-        attn_output: dict[str, Array] = self.self_attn(x)
-        x = attn_output["x"]
-        mlp_output: Array = self.mlp(x + attn_output)
-        return {
-            "x": x,
-            "attn_output": attn_output,
-
-
+    def __call__(self, x: Array) -> Array:
+        attn_output: Array = self.self_attn(x)
+        return x + self.mlp(x + attn_output)
