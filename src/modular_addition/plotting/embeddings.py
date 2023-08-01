@@ -9,11 +9,6 @@ weights: hk.MutableParams = restore(
     "checkpoints/modular-addition/wd-0.01-tf-0.7/checkpoint-5000/"
 )
 
-embedding_matrix: Array = weights["embeddings"]["w"][:, 0:1]
+embedding_matrix: Array = weights["embeddings"]["w"][:, 17:18]
 
-px.imshow(embedding_matrix).show()
-
-import pdb
-
-pdb.set_trace()
-print()
+px.line(embedding_matrix).show()

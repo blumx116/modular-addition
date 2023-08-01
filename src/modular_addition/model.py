@@ -1,4 +1,4 @@
-from typing import NamedTuple, Optional, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
 
 import haiku as hk
 import jax
@@ -6,10 +6,13 @@ import jax.nn as nn
 import jax.numpy as jnp
 import numpy as np
 import optax
+from chex import ArrayNumpy
 from haiku.initializers import Initializer
 from jax import Array
 from jax.random import KeyArray, PRNGKey
 from optax import GradientTransformation, OptState, Params
+
+FrozenValues = dict[str, Any]
 
 
 class Embeddings(hk.Module):
@@ -85,9 +88,25 @@ class FusedSelfAttention(hk.Module):
         super().__init__(name)
         self.n_heads: int = n_heads
 
-    def __call__(self, x: Array) -> Array:
-        # x: (b, T, d)
-        *_, seq_len, d_model = x.shape
+    def _qkv(self, x: Array, d_model: int, frozen: FrozenValues) -> dict[str, Array]:
+        """
+        Parameters
+        ----------
+        x : (b, T, d)
+        cache: {
+            "q"?: (b, h, T, d // h)
+            "k"?: (b, h, T, d // h)
+            "v"?: (b, h, T, d // h)
+        }
+        Returns
+        -------
+        {
+            "q": (b, h, T, d // h)
+            "k": (b, h, T, d // h)
+            "v": (b, h, T, d // h)
+        }
+
+        """
 
         w_qkv: Array = hk.get_parameter(
             "w_qkv",
@@ -110,20 +129,69 @@ class FusedSelfAttention(hk.Module):
         q, k, v = jnp.split(qkv, 3, axis=-1)
         # q, k, v: (b, h, T, d // h)
 
-        # TODO: swap to k
-        raw_attn: Array = q @ jnp.swapaxes(k, -2, -1)
-        # raw_attn: (b, h, T, T)
-        raw_attn /= np.sqrt(d_model)
+        return {
+            "q": frozen.get("q", q),
+            "k": frozen.get("k", k),
+            "v": frozen.get("v", v),
+        }
 
-        mask: Array = jnp.tri(seq_len)
+    def _attn(
+        self, q: Array, k: Array, d_model: int, frozen: FrozenValues
+    ) -> dict[str, Array]:
+        """
+        Parameters
+        ----------
+        q: (b, h, T, d // h)
+        k: (b, h, T, d // h)
+        cache: {
+            "attn_logits"?: (b, h, T, T),
+            "mask"?: (T, T),
+            "masked_attn"?: (b, h, T, T)
+        }
+        Returns
+        -------
+        {
+            "attn_logits": (b, h, T, T),
+            "mask": (T, T),
+            "masked_attn": (b, h, T, T)
+        }
+
+        """
+        attn_logits: Array = frozen.get(
+            "attn_logits", q @ jnp.swapaxes(k, -2, -1) / np.sqrt(d_model)
+        )
+        # raw_attn: (b, h, T, T)
+
+        *_, seq_len = attn_logits.shape
+        mask: Array = frozen.get("mask", jnp.tri(seq_len))
         # (T, T)
-        masked_attn: Array = jnp.where(mask, raw_attn, -1e30)
+
+        masked_attn: Array = jnp.where(mask, attn_logits, -1e30)
         # (b, h, T, T) -> broadcasting on the first two dims
 
         attn: Array = nn.softmax(masked_attn, axis=-1)
         # (b, h, T, T)
 
-        attn_vals: Array = attn @ v
+        return {
+            "attn_logits": attn_logits,
+            "mask": mask,
+            "attn": frozen.get("attn", attn),
+        }
+
+    def __call__(self, x: Array, frozen: FrozenValues) -> FrozenValues:
+        """
+        Parameters
+        ----------
+        x : (b, T, d)
+        Returns
+        -------
+        """
+        *_, d_model = x.shape
+
+        qkv: dict[str, Array] = self._qkv(x, d_model, frozen)
+        attn: dict[str, Array] = self._attn(qkv["q"], qkv["k"], d_model, frozen)
+
+        attn_vals: Array = attn["attn"] @ qkv["v"]
         # (b, h, T, d // h)
 
         attn_vals = jnp.swapaxes(attn_vals, -3, -2)
@@ -139,7 +207,7 @@ class FusedSelfAttention(hk.Module):
         # (d, d)
 
         # (b, T, d)
-        return attn_vals @ w_o
+        return {"out": frozen.get("out", attn_vals @ w_o), **qkv, **attn}
 
 
 class ReLU(hk.Module):
@@ -147,16 +215,40 @@ class ReLU(hk.Module):
         return nn.relu(x)
 
 
+class MLP(hk.Module):
+    def __init__(self, d_mlp_nodes: int, d_out: int, name: Optional[str] = None):
+        super().__init__(name)
+        self.linear1 = hk.Linear(d_mlp_nodes)
+        self.linear2 = hk.Linear(d_out)
+
+    def __call__(self, x: Array, frozen: FrozenValues) -> FrozenValues:
+        result: FrozenValues = {}
+
+        result["neurons"] = frozen.get("neurons", self.linear1(x))
+        result["relu_neurons"] = frozen.get("relu_neurons", nn.relu(result["neurons"]))
+        result["out"] = frozen.get("out", self.linear2(result["relu_neurons"]))
+
+        return result
+
+
 class TransformerBlock(hk.Module):
     def __init__(
-        self, n_heads: int, n_mlp_nodes: int, d_model: int, name: Optional[str] = None
+        self, n_heads: int, d_mlp_nodes: int, d_model: int, name: Optional[str] = None
     ):
         super().__init__(name)
-        self.self_attn: hk.Module = FusedSelfAttention(n_heads, "self_attn")
-        self.mlp: hk.Module = hk.Sequential(
-            [hk.Linear(n_mlp_nodes), ReLU(), hk.Linear(d_model)]
-        )
+        self.self_attn = FusedSelfAttention(n_heads, "self_attn")
+        self.mlp = MLP(d_mlp_nodes, d_model, "mlp")
 
-    def __call__(self, x: Array) -> Array:
-        attn_output: Array = self.self_attn(x)
-        return x + self.mlp(x + attn_output)
+    def __call__(self, x: Array, frozen: FrozenValues) -> FrozenValues:
+        result: FrozenValues = {}
+
+        result["self_attn"] = self.self_attn(x, frozen.get("self_attn", {}))
+        result["pre_mlp_residual"] = frozen.get(
+            "pre_mlp_residual", x + result["self_attn"]["out"]
+        )
+        result["mlp"] = self.mlp(
+            result["pre_mlp_residual"], frozen=frozen.get("mlp", {})
+        )
+        result["out"] = frozen.get("out", x + result["mlp"]["out"])
+
+        return result

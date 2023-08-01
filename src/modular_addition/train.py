@@ -17,7 +17,7 @@ from jax.random import KeyArray, PRNGKey
 from optax import GradientTransformation, OptState, Params
 from tqdm import tqdm
 
-from modular_addition.model import Embeddings, TransformerBlock, Unembed
+from modular_addition.model import Embeddings, FrozenValues, TransformerBlock, Unembed
 from modular_addition.utils import BatchReturn, StepReturn, save
 
 N_EPOCHS: int = 50000
@@ -30,17 +30,26 @@ D_MODEL: int = 128
 ETA: float = 3e-4
 
 
-def model(x: Array) -> Array:
+def model(x: Array, frozen: FrozenValues) -> Tuple[Array, FrozenValues]:
+    result: FrozenValues = {}
     # x: (b, T) # int IDs
-    embedding: Array = Embeddings(D_VOCAB, D_MODEL, name="embeddings")(x)
+
+    result["embedding"] = frozen.get(
+        "embedding", Embeddings(D_VOCAB, D_MODEL, name="embeddings")(x)
+    )
     # embedding: (b, T, d)
-    representation: Array = TransformerBlock(
+
+    result["representation"] = TransformerBlock(
         N_HEADS, N_MLP_NODES, D_MODEL, name="transformer"
-    )(embedding)
+    )(result["embedding"], frozen.get("representation", {}))
     # representation: (b, T, d)
-    result: Array = Unembed(D_VOCAB, name="unembeddings")(representation)
+
+    result["out"] = frozen.get(
+        "unembeddings",
+        Unembed(D_VOCAB, name="unembeddings")(result["representation"]["out"]),
+    )
     # result: (b, T, vocab)
-    return result
+    return result["out"], result
 
 
 def loss(logits: Array, targets: Array) -> Array:
@@ -63,7 +72,7 @@ def forward_with_loss(x: Array, y: Array) -> Array:
     # x: (b, T) # int ids
     # y: (b, T) # int ids
     #   NOTE: -1 is used as convention for masked loss
-    logits: Array = model(x)
+    logits, _ = model(x, frozen={})
     # preds: (b, T, vocab)
     # ignore all but last timestep prediction
     return loss(logits, y)
@@ -163,9 +172,6 @@ def fit(weight_decay: float, train_frac: float) -> tuple[list[float], list[float
 
     xdummy, ydummy, rng = generate_train_batch(rng)
     init, apply = hk.transform(forward_with_loss)
-
-    _, fw = hk.transform(model)  # used for debugging
-
     params: hk.MutableParams = init(rng=rng, x=xdummy, y=ydummy)
 
     optimizer: GradientTransformation = optax.chain(
